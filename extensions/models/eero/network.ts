@@ -146,8 +146,7 @@ export const model = {
         const sessionToken = await eeroLoginVerify(args.userToken, args.code);
 
         context.logger.info(
-          'Authentication successful. Session token: {token} — save it with: swamp vault put eero session-token "{token}"',
-          { token: sessionToken },
+          "Authentication successful. Check the auth-state resource output for the token, then run: swamp vault put eero session-token <token>",
         );
 
         const handle = await context.writeResource("auth-state", "verified", {
@@ -173,8 +172,7 @@ export const model = {
         const newToken = await eeroLoginRefresh(g.sessionToken);
 
         context.logger.info(
-          'Token refreshed: {token} — update vault with: swamp vault put eero session-token "{token}"',
-          { token: newToken },
+          "Token refreshed. Check the auth-state resource output for the new token, then run: swamp vault put eero session-token <token>",
         );
 
         const handle = await context.writeResource("auth-state", "refreshed", {
@@ -644,6 +642,732 @@ export const model = {
             path: networkId,
             method: args.updates ? "PUT" : "GET",
             response: settingsData,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+    // =========================================================================
+    // NODE DETAILS
+    // =========================================================================
+
+    connections: {
+      description:
+        "Get per-node port details, wiring topology, LLDP neighbors, and negotiated speeds.",
+      arguments: z.object({}),
+      execute: async (_args, context) => {
+        const g = context.globalArgs;
+        const networkId = await getFirstNetworkPath(g.sessionToken);
+
+        const result = await eeroApi(
+          `${networkId}/eeros`,
+          g.sessionToken,
+        );
+        const eeroList = (result.data as Array<Record<string, unknown>>) ?? [];
+
+        const handles = [];
+        for (const e of eeroList) {
+          const eid = extractId(e.url as string);
+          const name = (e.location as string) ?? eid;
+
+          const connResult = await eeroApi(
+            `/eeros/${eid}/connections`,
+            g.sessionToken,
+          );
+
+          // Also grab the ethernet_status from the eero detail for LLDP
+          const ethStatus = e.ethernet_status as Record<string, unknown> ?? {};
+
+          context.logger.info("Connections for {name}", { name });
+
+          const handle = await context.writeResource(
+            "api-response",
+            sanitizeId(`connections-${name}`),
+            {
+              path: `/eeros/${eid}/connections`,
+              method: "GET",
+              response: {
+                name,
+                model: e.model,
+                bands: e.bands,
+                bssids_with_bands: e.bssids_with_bands,
+                ports: connResult.data,
+                ethernet_status: ethStatus,
+                is_primary_node: e.is_primary_node,
+                connection_type: e.connection_type,
+              },
+            },
+          );
+          handles.push(handle);
+        }
+
+        return { dataHandles: handles };
+      },
+    },
+
+    // =========================================================================
+    // ROUTING & NETWORK INTERNALS
+    // =========================================================================
+
+    routing: {
+      description: "Get eero network routing table.",
+      arguments: z.object({}),
+      execute: async (_args, context) => {
+        const g = context.globalArgs;
+        const networkId = await getFirstNetworkPath(g.sessionToken);
+
+        const result = await eeroApi(
+          `${networkId}/routing`,
+          g.sessionToken,
+        );
+
+        context.logger.info("Routing table retrieved");
+
+        const handle = await context.writeResource(
+          "api-response",
+          "routing",
+          {
+            path: `${networkId}/routing`,
+            method: "GET",
+            response: result.data,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    transfer: {
+      description: "Get network-wide data transfer statistics.",
+      arguments: z.object({}),
+      execute: async (_args, context) => {
+        const g = context.globalArgs;
+        const networkId = await getFirstNetworkPath(g.sessionToken);
+
+        const result = await eeroApi(
+          `${networkId}/transfer`,
+          g.sessionToken,
+        );
+
+        context.logger.info("Transfer stats retrieved");
+
+        const handle = await context.writeResource(
+          "api-response",
+          "transfer",
+          {
+            path: `${networkId}/transfer`,
+            method: "GET",
+            response: result.data,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // =========================================================================
+    // DHCP & DNS
+    // =========================================================================
+
+    reservations: {
+      description: "List DHCP reservations.",
+      arguments: z.object({}),
+      execute: async (_args, context) => {
+        const g = context.globalArgs;
+        const networkId = await getFirstNetworkPath(g.sessionToken);
+
+        const result = await eeroApi(
+          `${networkId}/reservations`,
+          g.sessionToken,
+        );
+        const reservations = (result.data as Array<Record<string, unknown>>) ??
+          [];
+
+        context.logger.info("DHCP reservations: {count}", {
+          count: reservations.length,
+        });
+
+        const handle = await context.writeResource(
+          "api-response",
+          "reservations",
+          {
+            path: `${networkId}/reservations`,
+            method: "GET",
+            response: reservations,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    "dns-policies": {
+      description:
+        "Get DNS policy configuration — ad blocking, malware blocking, content filters.",
+      arguments: z.object({}),
+      execute: async (_args, context) => {
+        const g = context.globalArgs;
+        const networkId = await getFirstNetworkPath(g.sessionToken);
+
+        // Try multiple DNS-related endpoints
+        const results: Record<string, unknown> = {};
+
+        for (const ep of ["dns_policies", "dns_policies/network"]) {
+          try {
+            const r = await eeroApi(
+              `${networkId}/${ep}`,
+              g.sessionToken,
+            );
+            results[ep] = r.data;
+          } catch {
+            results[ep] = "not_available";
+          }
+        }
+
+        context.logger.info("DNS policies retrieved");
+
+        const handle = await context.writeResource(
+          "api-response",
+          "dns-policies",
+          {
+            path: `${networkId}/dns_policies`,
+            method: "GET",
+            response: results,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // =========================================================================
+    // THREAD / SMART HOME
+    // =========================================================================
+
+    thread: {
+      description:
+        "Get Thread smart home mesh network status — channel, credentials, border agents.",
+      arguments: z.object({}),
+      execute: async (_args, context) => {
+        const g = context.globalArgs;
+        const networkId = await getFirstNetworkPath(g.sessionToken);
+
+        const result = await eeroApi(
+          `${networkId}/thread`,
+          g.sessionToken,
+        );
+
+        context.logger.info("Thread network status retrieved");
+
+        const handle = await context.writeResource(
+          "api-response",
+          "thread",
+          {
+            path: `${networkId}/thread`,
+            method: "GET",
+            response: result.data,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // =========================================================================
+    // GUEST NETWORK
+    // =========================================================================
+
+    "guest-network": {
+      description: "Get or set guest network configuration.",
+      arguments: z.object({
+        enabled: z.boolean().optional().describe(
+          "Set true/false to enable/disable. Omit to read current state.",
+        ),
+        name: z.string().optional().describe("Guest network SSID"),
+        password: z.string().optional().describe("Guest network password"),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const networkId = await getFirstNetworkPath(g.sessionToken);
+
+        if (args.enabled !== undefined) {
+          const body: Record<string, unknown> = { enabled: args.enabled };
+          if (args.name) body.name = args.name;
+          if (args.password) body.password = args.password;
+
+          await eeroApi(`${networkId}/guestnetwork`, g.sessionToken, {
+            method: "PUT",
+            body,
+          });
+          context.logger.info("Guest network {action}", {
+            action: args.enabled ? "enabled" : "disabled",
+          });
+        }
+
+        const net = await eeroApi(networkId, g.sessionToken);
+        const d = net.data as Record<string, unknown>;
+
+        const handle = await context.writeResource(
+          "api-response",
+          "guest-network",
+          {
+            path: `${networkId}/guestnetwork`,
+            method: args.enabled !== undefined ? "PUT" : "GET",
+            response: d.guest_network,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // =========================================================================
+    // WIFI CONTROLS
+    // =========================================================================
+
+    "hide-5ghz": {
+      description:
+        "Temporarily hide the 5 GHz bands network-wide — forces all devices to 2.4 GHz. Use to diagnose band-specific issues or for stubborn IoT pairing.",
+      arguments: z.object({
+        hide: z.boolean().describe(
+          "true to hide 5 GHz (force 2.4 GHz only), false to restore",
+        ),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const networkId = await getFirstNetworkPath(g.sessionToken);
+
+        if (args.hide) {
+          await eeroApi(
+            `${networkId}/temporary_flags/hide_5g`,
+            g.sessionToken,
+            { method: "PUT", body: { value: true } },
+          );
+          context.logger.info("5 GHz bands hidden — 2.4 GHz only mode");
+        } else {
+          await eeroApi(
+            `${networkId}/temporary_flags/hide_5g`,
+            g.sessionToken,
+            { method: "DELETE" },
+          );
+          context.logger.info("5 GHz bands restored");
+        }
+
+        const handle = await context.writeResource(
+          "api-response",
+          "hide-5ghz",
+          {
+            path: `${networkId}/temporary_flags/hide_5g`,
+            method: args.hide ? "PUT" : "DELETE",
+            response: { hidden: args.hide },
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    "wifi-password": {
+      description: "Get the WiFi network password.",
+      arguments: z.object({}),
+      execute: async (_args, context) => {
+        const g = context.globalArgs;
+        const networkId = await getFirstNetworkPath(g.sessionToken);
+
+        const result = await eeroApi(
+          `${networkId}/password`,
+          g.sessionToken,
+        );
+
+        context.logger.info("WiFi password retrieved");
+
+        const handle = await context.writeResource(
+          "api-response",
+          "wifi-password",
+          {
+            path: `${networkId}/password`,
+            method: "GET",
+            response: result.data,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // =========================================================================
+    // FIRMWARE
+    // =========================================================================
+
+    updates: {
+      description:
+        "Get firmware update status, target version, and trigger updates.",
+      arguments: z.object({
+        trigger: z.boolean().default(false).describe(
+          "Set true to trigger a firmware update. False just checks status.",
+        ),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const networkId = await getFirstNetworkPath(g.sessionToken);
+
+        if (args.trigger) {
+          await eeroApi(`${networkId}/updates`, g.sessionToken, {
+            method: "POST",
+          });
+          context.logger.info("Firmware update triggered");
+        }
+
+        const result = await eeroApi(
+          `${networkId}/updates`,
+          g.sessionToken,
+        );
+
+        context.logger.info("Update status retrieved");
+
+        const handle = await context.writeResource(
+          "api-response",
+          "updates",
+          {
+            path: `${networkId}/updates`,
+            method: args.trigger ? "POST" : "GET",
+            response: result.data,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // =========================================================================
+    // DIAGNOSTICS
+    // =========================================================================
+
+    diagnostics: {
+      description:
+        "Run or retrieve eero network diagnostics — connectivity checks, node health.",
+      arguments: z.object({
+        trigger: z.boolean().default(false).describe(
+          "Set true to trigger a new diagnostic run.",
+        ),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const networkId = await getFirstNetworkPath(g.sessionToken);
+
+        if (args.trigger) {
+          await eeroApi(`${networkId}/diagnostics`, g.sessionToken, {
+            method: "POST",
+          });
+          context.logger.info("Diagnostics triggered");
+        }
+
+        const result = await eeroApi(
+          `${networkId}/diagnostics`,
+          g.sessionToken,
+        );
+
+        context.logger.info("Diagnostics retrieved");
+
+        const handle = await context.writeResource(
+          "api-response",
+          "diagnostics",
+          {
+            path: `${networkId}/diagnostics`,
+            method: args.trigger ? "POST" : "GET",
+            response: result.data,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // =========================================================================
+    // DEVICE MANAGEMENT
+    // =========================================================================
+
+    "device-detail": {
+      description:
+        "Get detailed info for a single device by MAC address — full connectivity, transfer stats, profile assignment.",
+      arguments: z.object({
+        mac: z.string().describe(
+          "Device MAC address (colons or no separators, e.g., 'aa:bb:cc:dd:ee:ff' or 'aabbccddeeff')",
+        ),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const networkId = await getFirstNetworkPath(g.sessionToken);
+        const mac = args.mac.replace(/[:-]/g, "").toLowerCase();
+
+        const [device, transfer] = await Promise.all([
+          eeroApi(`${networkId}/devices/${mac}`, g.sessionToken),
+          eeroApi(
+            `${networkId}/devices/${mac}/transfer`,
+            g.sessionToken,
+          ).catch(() => ({ data: null, meta: { code: 0 } })),
+        ]);
+
+        context.logger.info("Device detail for {mac}", { mac: args.mac });
+
+        const handle = await context.writeResource(
+          "api-response",
+          sanitizeId(`device-${mac}`),
+          {
+            path: `${networkId}/devices/${mac}`,
+            method: "GET",
+            response: {
+              device: device.data,
+              transfer: transfer.data,
+            },
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    "device-pause": {
+      description:
+        "Pause or unpause a device's internet access by MAC address.",
+      arguments: z.object({
+        mac: z.string().describe("Device MAC address"),
+        paused: z.boolean().describe("true to pause, false to unpause"),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const networkId = await getFirstNetworkPath(g.sessionToken);
+        const mac = args.mac.replace(/[:-]/g, "").toLowerCase();
+
+        const result = await eeroApi(
+          `${networkId}/devices/${mac}`,
+          g.sessionToken,
+          {
+            method: "PUT",
+            body: { paused: args.paused },
+            apiVersion: "2.3",
+          },
+        );
+
+        context.logger.info("Device {mac} {action}", {
+          mac: args.mac,
+          action: args.paused ? "paused" : "unpaused",
+        });
+
+        const handle = await context.writeResource(
+          "api-response",
+          sanitizeId(`device-pause-${mac}`),
+          {
+            path: `${networkId}/devices/${mac}`,
+            method: "PUT",
+            response: result.data,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // =========================================================================
+    // BLOCKED DEVICES
+    // =========================================================================
+
+    blacklist: {
+      description: "List blocked devices or block/unblock a device by MAC.",
+      arguments: z.object({
+        action: z.enum(["list", "block", "unblock"]).default("list"),
+        mac: z.string().optional().describe(
+          "Device MAC for block/unblock actions",
+        ),
+      }),
+      execute: async (args, context) => {
+        const g = context.globalArgs;
+        const networkId = await getFirstNetworkPath(g.sessionToken);
+
+        let result: unknown;
+        if (args.action === "block" && args.mac) {
+          const r = await eeroApi(`${networkId}/blacklist`, g.sessionToken, {
+            method: "POST",
+            body: { device_id: args.mac.replace(/[:-]/g, "").toLowerCase() },
+          });
+          result = r.data;
+          context.logger.info("Blocked device {mac}", { mac: args.mac });
+        } else if (args.action === "unblock" && args.mac) {
+          const mac = args.mac.replace(/[:-]/g, "").toLowerCase();
+          const r = await eeroApi(
+            `${networkId}/blacklist/${mac}`,
+            g.sessionToken,
+            { method: "DELETE" },
+          );
+          result = r.data;
+          context.logger.info("Unblocked device {mac}", { mac: args.mac });
+        } else {
+          const r = await eeroApi(`${networkId}/blacklist`, g.sessionToken);
+          result = r.data;
+          context.logger.info("Blacklist retrieved");
+        }
+
+        const handle = await context.writeResource(
+          "api-response",
+          "blacklist",
+          {
+            path: `${networkId}/blacklist`,
+            method: args.action === "list" ? "GET" : "POST",
+            response: result,
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    // =========================================================================
+    // FULL DIAGNOSTIC DUMP
+    // =========================================================================
+
+    "full-diagnostic": {
+      description:
+        "Pull a comprehensive diagnostic dump — network, all nodes with LLDP/ports, all clients with band/signal, routing, transfer stats, DNS, Thread, and settings. One method to capture everything.",
+      arguments: z.object({}),
+      execute: async (_args, context) => {
+        const g = context.globalArgs;
+        const networkId = await getFirstNetworkPath(g.sessionToken);
+
+        const [
+          network,
+          eeros,
+          devices,
+          routing,
+          transfer,
+          thread,
+          reservations,
+          updates,
+        ] = await Promise.all([
+          eeroApi(networkId, g.sessionToken),
+          eeroApi(`${networkId}/eeros`, g.sessionToken),
+          eeroApi(`${networkId}/devices`, g.sessionToken),
+          eeroApi(`${networkId}/routing`, g.sessionToken).catch(() => ({
+            data: null,
+            meta: { code: 0 },
+          })),
+          eeroApi(`${networkId}/transfer`, g.sessionToken).catch(() => ({
+            data: null,
+            meta: { code: 0 },
+          })),
+          eeroApi(`${networkId}/thread`, g.sessionToken).catch(() => ({
+            data: null,
+            meta: { code: 0 },
+          })),
+          eeroApi(`${networkId}/reservations`, g.sessionToken).catch(() => ({
+            data: null,
+            meta: { code: 0 },
+          })),
+          eeroApi(`${networkId}/updates`, g.sessionToken).catch(() => ({
+            data: null,
+            meta: { code: 0 },
+          })),
+        ]);
+
+        // Get per-node connection details
+        const eeroNodes = (eeros.data as Array<Record<string, unknown>>) ?? [];
+        const nodeConnections: Record<string, unknown> = {};
+        for (const e of eeroNodes) {
+          const eid = extractId(e.url as string);
+          const name = (e.location as string) ?? eid;
+          try {
+            const conn = await eeroApi(
+              `/eeros/${eid}/connections`,
+              g.sessionToken,
+            );
+            nodeConnections[name] = {
+              model: e.model,
+              bands: e.bands,
+              bssids_with_bands: e.bssids_with_bands,
+              is_primary_node: e.is_primary_node,
+              connection_type: e.connection_type,
+              ethernet_status: e.ethernet_status,
+              ports: conn.data,
+              os_version: e.os_version,
+              connected_clients: e.connected_clients_count,
+              connected_wireless: e.connected_wireless_clients_count,
+              connected_wired: e.connected_wired_clients_count,
+              ip_address: e.ip_address,
+              gateway: e.gateway,
+              mesh_quality_bars: e.mesh_quality_bars,
+              organization: e.organization,
+            };
+          } catch {
+            nodeConnections[name] = { error: "failed to fetch connections" };
+          }
+        }
+
+        // Process client list
+        const clientList = (devices.data as Array<Record<string, unknown>>) ??
+          [];
+        const clients = clientList.map((dev) => {
+          const iface = (dev.interface as Record<string, unknown>) ?? {};
+          const conn = (dev.connectivity as Record<string, unknown>) ?? {};
+          const source = (dev.source as Record<string, unknown>) ?? {};
+          return {
+            mac: dev.mac,
+            hostname: dev.hostname,
+            nickname: dev.nickname,
+            ip: dev.ip,
+            connected: dev.connected,
+            wireless: dev.wireless,
+            frequency: iface.frequency,
+            channel: dev.channel,
+            signal: conn.signal,
+            signal_avg: conn.signal_avg,
+            score: conn.score,
+            score_bars: conn.score_bars,
+            rx_bitrate: conn.rx_bitrate,
+            tx_bitrate: conn.tx_bitrate,
+            connected_to: source.location,
+            manufacturer: dev.manufacturer,
+            connection_type: dev.connection_type,
+            paused: dev.paused,
+            last_active: dev.last_active,
+            ips: dev.ips,
+          };
+        });
+
+        const netData = network.data as Record<string, unknown>;
+
+        const diagnostic = {
+          network: {
+            name: netData.name,
+            status: netData.status,
+            health: netData.health,
+            gateway: netData.gateway,
+            connection: netData.connection,
+            band_steering: netData.band_steering,
+            ipv6_upstream: netData.ipv6_upstream,
+            wpa3: netData.wpa3,
+            upnp: netData.upnp,
+            sqm: netData.sqm,
+            dns: netData.dns,
+            speed: netData.speed,
+            lease: netData.lease,
+            ip_settings: netData.ip_settings,
+            wan_ip: netData.wan_ip,
+            wan_type: netData.wan_type,
+            gateway_ip: netData.gateway_ip,
+            flags: netData.flags,
+            temporary_flags: netData.temporary_flags,
+            wireless_mode: netData.wireless_mode,
+          },
+          nodes: nodeConnections,
+          clients,
+          routing: routing.data,
+          transfer: transfer.data,
+          thread: thread.data,
+          reservations: reservations.data,
+          updates: updates.data,
+        };
+
+        context.logger.info(
+          "Full diagnostic: {nodes} nodes, {clients} clients",
+          {
+            nodes: eeroNodes.length,
+            clients: clients.length,
+          },
+        );
+
+        const handle = await context.writeResource(
+          "api-response",
+          "full-diagnostic",
+          {
+            path: "full-diagnostic",
+            method: "GET",
+            response: diagnostic,
           },
         );
         return { dataHandles: [handle] };
