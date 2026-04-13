@@ -22,6 +22,7 @@ export const EeroGlobalArgsSchema = z.object({
   sessionToken: z
     .string()
     .default("")
+    .meta({ sensitive: true })
     .describe(
       "Eero session token. Use: ${{ vault.get(eero, session-token) }}. Empty until auth-verify is run.",
     ),
