@@ -21,7 +21,7 @@ import {
  */
 export const model = {
   type: "@dougschaefer/eero-network",
-  version: "2026.04.04.2",
+  version: "2026.05.26.1",
   globalArguments: EeroGlobalArgsSchema,
   resources: {
     "auth-state": {
