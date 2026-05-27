@@ -8,9 +8,20 @@ import {
   sanitizeId,
 } from "./_client.ts";
 
+/**
+ * `@dougschaefer/eero-network` model — manages an eero mesh WiFi
+ * deployment via the reverse-engineered cloud API. Authentication is a
+ * two-step refresh flow (loginStart → loginVerify, then loginRefresh to
+ * extend); credentials and refresh tokens are vault-resolved. Read
+ * methods enumerate the network overview, per-eero node telemetry,
+ * connected clients with band/signal/channel diagnostics, settings,
+ * routing, and historical transfer. Mutations are deliberately narrow:
+ * band steering toggle and per-node reboot. Use api as a generic
+ * passthrough for endpoints that haven't been wrapped explicitly.
+ */
 export const model = {
   type: "@dougschaefer/eero-network",
-  version: "2026.04.04.2",
+  version: "2026.05.27.1",
   globalArguments: EeroGlobalArgsSchema,
   resources: {
     "auth-state": {
@@ -98,6 +109,43 @@ export const model = {
       }),
       lifetime: "1h",
       garbageCollection: 5,
+    },
+  },
+
+  checks: {
+    "session-valid": {
+      description:
+        "Verify the eero session token is valid before executing mutating or impactful operations.",
+      labels: ["live"],
+      appliesTo: [
+        "reboot-node",
+        "device-pause",
+        "hide-5ghz",
+        "blacklist",
+        "settings",
+      ],
+      execute: async (context) => {
+        try {
+          const g = context.globalArgs;
+          if (!g.sessionToken) {
+            return {
+              pass: false,
+              errors: [
+                "No session token configured. Run auth-start and auth-verify first.",
+              ],
+            };
+          }
+          await eeroApi("/account", g.sessionToken);
+          return { pass: true };
+        } catch (err) {
+          return {
+            pass: false,
+            errors: [
+              `Eero session invalid or expired: ${String(err)}`,
+            ],
+          };
+        }
+      },
     },
   },
 
@@ -961,7 +1009,8 @@ export const model = {
     },
 
     "wifi-password": {
-      description: "Get the WiFi network password.",
+      description:
+        "Get the WiFi network password. The plaintext PSK is NOT stored in any resource to avoid persisting credentials in cleartext; the method returns only confirmation metadata.",
       arguments: z.object({}),
       execute: async (_args, context) => {
         const g = context.globalArgs;
@@ -972,7 +1021,17 @@ export const model = {
           g.sessionToken,
         );
 
-        context.logger.info("WiFi password retrieved");
+        // Deliberately omit the PSK from the stored resource.  The raw
+        // data is available in the method's return value during the run
+        // but we do not persist plaintext Wi-Fi credentials to the
+        // resource store.
+        const safe = { ...result.data as Record<string, unknown> };
+        if ("password" in safe) delete safe.password;
+        if ("psk" in safe) delete safe.psk;
+
+        context.logger.info(
+          "WiFi password retrieved (PSK omitted from stored resource)",
+        );
 
         const handle = await context.writeResource(
           "api-response",
@@ -980,7 +1039,7 @@ export const model = {
           {
             path: `${networkId}/password`,
             method: "GET",
-            response: result.data,
+            response: safe,
           },
         );
         return { dataHandles: [handle] };
@@ -1205,6 +1264,130 @@ export const model = {
           },
         );
         return { dataHandles: [handle] };
+      },
+    },
+
+    // =========================================================================
+    // SYNC
+    // =========================================================================
+
+    sync: {
+      description:
+        "Refresh network overview, all eero nodes, and all connected clients into resources in one call.",
+      arguments: z.object({}),
+      execute: async (_args, context) => {
+        const g = context.globalArgs;
+        const networkId = await getFirstNetworkPath(g.sessionToken);
+
+        const [netResult, eeResult, devResult] = await Promise.all([
+          eeroApi(networkId, g.sessionToken),
+          eeroApi(`${networkId}/eeros`, g.sessionToken),
+          eeroApi(`${networkId}/devices`, g.sessionToken),
+        ]);
+
+        const handles = [];
+
+        // Network resource
+        const d = netResult.data as Record<string, unknown>;
+        const speed = d.speed as Record<string, unknown> ?? {};
+        const health = d.health as Record<string, unknown> ?? {};
+        const sqm = d.sqm as Record<string, unknown> ?? {};
+        const eeros = d.eeros as Record<string, unknown> ?? {};
+        const clients = d.clients as Record<string, unknown> ?? {};
+        const netData = {
+          id: networkId.split("/").pop() ?? "",
+          name: (d.name as string) ?? "",
+          status: (d.status as string) ?? "",
+          health,
+          bandSteering: d.band_steering === true,
+          ipv6: d.ipv6_upstream === true,
+          dns: d.dns as unknown ?? {},
+          sqm,
+          speed,
+          eeroCount: (eeros.count as number) ?? 0,
+          clientCount: (clients.count as number) ?? 0,
+          premiumStatus: (d.premium_status as string) ?? "none",
+        };
+        handles.push(
+          await context.writeResource(
+            "network",
+            sanitizeId(netData.name || netData.id),
+            netData,
+          ),
+        );
+
+        // Eero node resources
+        const eeroList = (eeResult.data as Array<Record<string, unknown>>) ??
+          [];
+        for (const e of eeroList) {
+          const eData = {
+            id: extractId(e.url as string),
+            name: (e.location as string) ?? "",
+            model: (e.model as string) ?? "",
+            status: (e.status as string) ?? "",
+            isGateway: e.gateway === true,
+            serial: (e.serial as string) ?? "",
+            macAddress: (e.mac_address as string) ?? "",
+            ipAddress: (e.ip_address as string) ?? "",
+            osVersion: (e.os_version as string) ?? "",
+            connectedClients: (e.connected_clients_count as number) ?? 0,
+            meshQuality: (e.mesh_quality_bars as string) ??
+              String(e.mesh_quality_bars ?? ""),
+            updateAvailable: e.update_available === true,
+          };
+          handles.push(
+            await context.writeResource(
+              "eero",
+              sanitizeId(eData.name || eData.id),
+              eData,
+            ),
+          );
+        }
+
+        // Client resources
+        const devices = (devResult.data as Array<Record<string, unknown>>) ??
+          [];
+        for (const dev of devices) {
+          const iface = (dev.interface as Record<string, unknown>) ?? {};
+          const conn = (dev.connectivity as Record<string, unknown>) ?? {};
+          const source = (dev.source as Record<string, unknown>) ?? {};
+          const ips = (dev.ips as Array<Record<string, string>>) ?? [];
+          const cData = {
+            mac: (dev.mac as string) ?? "",
+            hostname: (dev.hostname as string) ?? "",
+            nickname: (dev.nickname as string) ?? "",
+            ip: (dev.ip as string) ?? ips[0]?.address ?? "",
+            connected: dev.connected === true,
+            wireless: dev.wireless === true,
+            frequency: (iface.frequency as string) ?? "",
+            channel: (dev.channel as number) ?? 0,
+            signal: (conn.signal as string) ?? "",
+            signalAvg: (conn.signal_avg as string) ?? "",
+            score: (conn.score as number) ?? 0,
+            scoreBars: (conn.score_bars as number) ?? 0,
+            rxBitrate: (conn.rx_bitrate as string) ?? "",
+            txBitrate: (conn.tx_bitrate as string) ?? "",
+            connectedTo: (source.location as string) ?? "",
+            manufacturer: (dev.manufacturer as string) ?? "",
+            connectionType: (dev.connection_type as string) ?? "",
+            paused: dev.paused === true,
+            lastActive: (dev.last_active as string) ?? "",
+          };
+          handles.push(
+            await context.writeResource(
+              "client",
+              sanitizeId(cData.mac || cData.nickname || cData.hostname),
+              cData,
+            ),
+          );
+        }
+
+        context.logger.info(
+          "Sync complete: {nodes} nodes, {clients} clients",
+          { nodes: eeroList.length, clients: devices.length },
+        );
+
+        return { dataHandles: handles };
       },
     },
 
