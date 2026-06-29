@@ -21,7 +21,7 @@ import {
  */
 export const model = {
   type: "@dougschaefer/eero-network",
-  version: "2026.05.27.1",
+  version: "2026.06.29.1",
   globalArguments: EeroGlobalArgsSchema,
   resources: {
     "auth-state": {
@@ -927,7 +927,9 @@ export const model = {
           "Set true/false to enable/disable. Omit to read current state.",
         ),
         name: z.string().optional().describe("Guest network SSID"),
-        password: z.string().optional().describe("Guest network password"),
+        password: z.string().meta({ sensitive: true }).optional().describe(
+          "Guest network password",
+        ),
       }),
       execute: async (args, context) => {
         const g = context.globalArgs;
@@ -950,13 +952,19 @@ export const model = {
         const net = await eeroApi(networkId, g.sessionToken);
         const d = net.data as Record<string, unknown>;
 
+        // Strip the returned credential before persisting the response so the
+        // guest PSK is never written to the data store.
+        const guest = { ...(d.guest_network as Record<string, unknown>) };
+        delete guest.password;
+        delete guest.psk;
+
         const handle = await context.writeResource(
           "api-response",
           "guest-network",
           {
             path: `${networkId}/guestnetwork`,
             method: args.enabled !== undefined ? "PUT" : "GET",
-            response: d.guest_network,
+            response: guest,
           },
         );
         return { dataHandles: [handle] };
